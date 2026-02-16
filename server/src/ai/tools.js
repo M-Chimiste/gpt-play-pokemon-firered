@@ -1,19 +1,14 @@
 const fs = require('fs').promises;
-const fsSync = require('fs');
 const path = require('path');
-const axios = require('axios');
-const FormData = require('form-data');
 const { z } = require('zod');
 const { zodToJsonSchema } = require('zod-to-json-schema');
 const { config } = require('../config');
 const { state, setIsThinking } = require('../state/stateManager');
-const { calculateRequestCost } = require('../utils/costs');
 const { broadcast } = require('../core/socketHub');
 const { sendCommandsToPythonServer, requestConsoleRestart, fetchGameData } = require('../services/pythonService');
-const { minimapToMarkdown, formatTilesLegend } = require('../formatters/markdownFormatter');
-const { openai } = require('../core/openaiClient');
 const { recordPathfindingUsage } = require('../utils/tokenUsageTracker');
 const { recordReasoning: recordReasoningTime, recordToolBatch } = require('../utils/timeTracker');
+const { findLocalPath } = require('../utils/pathfinding/localPathfinder');
 
 function trunc(text, maxLen = 120) {
     if (text == null) return "";
@@ -931,6 +926,14 @@ async function handleToolCall(toolCall, gameDataJson) {
                             }
                         }
 
+                        if (path && path.reached_target && (!path.keys || path.keys.length === 0)) {
+                            pathfindingExecutedThisTurn = true;
+                            actionResult.success = true;
+                            actionResult.message = `Already at target (${path_x}, ${path_y}). ${path.explanation || ""}`.trim();
+                            actionResult.details = "No movement required.";
+                            break;
+                        }
+
                         if (path && path.keys && path.keys.length > 0) {
                             pathfindingExecutedThisTurn = true;
                             
@@ -1068,383 +1071,81 @@ async function findPath(x, y, map_id, explanation) {
     }
     console.log(`INFO: Finding path to (${x}, ${y}) on map ${position.map_name} (${position.map_id})`);
 
-    const gameAreaGrid = Array.isArray(gameDataJson.game_area_meta_tiles) ? gameDataJson.game_area_meta_tiles : [];
-    const gameAreaH = gameAreaGrid.length;
-    const gameAreaW = gameAreaH > 0 && Array.isArray(gameAreaGrid[0]) ? gameAreaGrid[0].length : 0;
-    const origin = gameDataJson?.visible_area_data?.origin || null;
-    let localRow = Number(position.y) - Number(origin?.y);
-    let localCol = Number(position.x) - Number(origin?.x);
-    if (!Number.isFinite(localRow) || localRow < 0 || localRow >= gameAreaH) {
-        localRow = gameAreaH ? Math.floor(gameAreaH / 2) : 0;
-    }
-    if (!Number.isFinite(localCol) || localCol < 0 || localCol >= gameAreaW) {
-        localCol = gameAreaW ? Math.floor(gameAreaW / 2) : 0;
+    const grid = gameDataJson?.minimap_data?.grid;
+    if (!Array.isArray(grid) || grid.length === 0 || !Array.isArray(grid[0])) {
+        throw new Error("Minimap grid unavailable for pathfinding.");
     }
 
-    const playerOrientationId = gameDataJson?.minimap_data?.orientation ?? null;
-    const minimapDisplay = minimapToMarkdown(
-        gameDataJson.minimap_data,
-        position.x,
-        position.y,
-        position.map_id,
-        position.map_name,
-        playerOrientationId,
-        gameAreaGrid,
-        localRow,
-        localCol,
-        gameDataJson?.npc_entries ?? null,
-        true
-    );
-
-    let minimapMarkdown = `
-
-<strength_status>
-    Strength ability active (can push boulders): ${gameDataJson.strength_enabled}
-</strength_status>
-
-<movement_mode>
-    Current player movement mode: ${gameDataJson.player_movement_mode}
-</movement_mode>
-
-<environment>
-    <current_map>
-    ${minimapDisplay}
-    </current_map>
-</environment>
-
-<target_location>
-    <x>${x}</x>
-    <y>${y}</y>
-</target_location>
-
-<explanation>
-${explanation}
-</explanation>
-
-<full_legend>
-${formatTilesLegend()}
-</full_legend>
-
-<json_file_content>
-${JSON.stringify(gameDataJson.minimap_data.grid, null, 2)}
-</json_file_content>
-
-<updated_code_instructions>
-- If you modify or add pathfinding logic, write the FULLY UPDATED Python code into a **new file inside the container** under \`/mnt/data\` (e.g., \`/mnt/data/updated_pathfinder.py\`).
-- Do NOT edit the 'uploaded_python_file' directly. Instead, copy it, make your changes to the copy, and specify the new file path in the 'updated_code_path' key.
-- Always clean and optimize the code when editing: improve docstrings and comments, remove duplicate code, and refine usage examples.
-- You may create multiple functions (e.g., 'plan_path', 'move_boulders', etc.). You don't need to combine everything into a single function—just ensure each function is well-documented with clear usage instructions.
-- If you reuse the existing uploaded code without any modifications, do NOT create a new file. Simply return an empty \`updated_code_path\`.
-- The file must remain runnable as a reusable module that can dynamically load the grid JSON and accept start/end coordinates as parameters.
-- Always include all code in a single file. Do NOT split it into multiple files.
-- Preserve all working features. Add comments and docstrings for clarity and usage guidance.
-- The file must be ready to be imported and executed as a module using \`importlib.util.spec_from_file_location\` and \`importlib.util.module_from_spec\`.
-- Always verify whether the current code handles the situation you are facing. If the code does not cover your current scenario, update it to handle that situation.
-- Always update the code when you use a new function that was not in the previous code. It's important to keep the code up to date and functional to avoid redoing it later.
-- CRITICAL: Never delete existing code or logic simply because it's not needed for the immediate situation. The code has been built incrementally throughout the journey and must be preserved. You should ONLY "enhance", "add features", or "optimize" the existing code—never replace it with situation-specific code that discards previous functionality.
-</updated_code_instructions>
-
-    `;
-
-    const pathFindingPrompt = await fs.readFile(path.join(config.promptsDir, "path_finding.txt"), "utf8");
-
-    await new Promise(setImmediate); // Allow event loop before potentially long API call
-
-    let container = null;
-    try {
-        container = await openai.containers.create({
-            name: "pathfinding-container"
-        });
-        console.log("✅ Container created:", container.id);
-    } catch (error) {
-        console.error("❌ Failed to create container:", error.message);
-        throw error;
+    const start = { x: Number(position.x), y: Number(position.y) };
+    const target = { x: Number(x), y: Number(y) };
+    if (![start.x, start.y, target.x, target.y].every(Number.isFinite)) {
+        throw new Error(`Invalid coordinates for pathfinding: start (${position.x}, ${position.y}) target (${x}, ${y})`);
     }
 
-
+    const movementMode = gameDataJson.player_movement_mode || "WALK";
     setIsThinking(true);
-    // Load the last full working code (if exists and not empty)
-    let lastFullWorkingCode = null;
-    let uploadedPyFile = null;
-    if (fsSync.existsSync(path.join(__dirname, '..', '..', 'tmp', 'temp_full_working_code.py'))) {
-        const lastFullWorkingCodePath = path.join(__dirname, '..', '..', 'tmp', 'temp_full_working_code.py');
-        lastFullWorkingCode = await fs.readFile(lastFullWorkingCodePath, 'utf8');
-        console.log(`Last full working code loaded from ${lastFullWorkingCodePath}`);
-
-        // Upload the Python file to the container
-        try {
-            const pyFormData = new FormData();
-            pyFormData.append('file', fsSync.createReadStream(lastFullWorkingCodePath));
-
-            const pyResponse = await axios.post(
-                `https://api.openai.com/v1/containers/${container.id}/files`,
-                pyFormData,
-                {
-                    headers: {
-                        'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
-                        ...pyFormData.getHeaders()
-                    }
-                }
-            );
-
-            uploadedPyFile = pyResponse.data;
-            console.log("✅ Python file uploaded successfully:", uploadedPyFile.path);
-        } catch (error) {
-            console.error("❌ Failed to upload Python file:", error.response?.data || error.message);
-            // Continue even if Python file upload fails
-        }
-    }
-    let uploadedFile = null;
     try {
-        const mapGridData = gameDataJson.minimap_data.grid;
-        const mapGridPath = path.join(__dirname, '..', '..', 'tmp', 'temp_map_grid.json');
+        const result = findLocalPath({
+            grid,
+            start,
+            target,
+            movementMode,
+        });
 
-        // Write the grid data to a temporary JSON file
-        await fs.writeFile(mapGridPath, JSON.stringify(mapGridData, null, 2));
-        const formData = new FormData();
-        formData.append('file', fsSync.createReadStream(mapGridPath));
+        const pathfindingDuration = Date.now() - pathfindingStart;
+        recordReasoningTime({
+            type: "pathfinding",
+            model: "local-pathfinder",
+            serviceTier: "local",
+            durationMs: pathfindingDuration,
+        });
 
-        const response = await axios.post(
-            `https://api.openai.com/v1/containers/${container.id}/files`,
-            formData,
-            {
-                headers: {
-                    'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
-                    ...formData.getHeaders()
-                }
-            }
-        );
-
-        uploadedFile = response.data;
-        console.log("✅ File uploaded successfully:", uploadedFile.path);
-    } catch (error) {
-        console.error("❌ Failed to upload file:", error.response?.data || error.message);
-        throw error;
-    }
-
-    if (lastFullWorkingCode) {
-        minimapMarkdown += "\n\n<last_full_working_code>\n**PRIORITY: Try this working code first (fast path)**\n\n" +
-            "Execute the code below ONCE with current inputs:\n" +
-            "1. Update ONLY: map JSON file path and coordinates\n" +
-            "2. Run immediately—no refactoring, optimization, or non-trivial changes\n" +
-            "3. If scenario requires mechanics this code doesn't support (spinners, boulders, etc.), skip to fresh implementation\n\n" +
-            "**Success criteria:** Non-empty path in correct format, respects all rules\n" +
-            "→ Output the path and STOP. No verification or commentary needed.\n\n" +
-            "**Failure conditions:** Error, empty/invalid path, rule violations, or requires non-trivial adaptation\n" +
-            "→ Abandon this code immediately. Write new solution from scratch.\n\n" +
-            "**Time budget:** Minimal. Single execution only—no iteration or tuning.\n\n" +
-            uploadedPyFile.path + "\n```python\n" + lastFullWorkingCode + "\n```\n</last_full_working_code>";
-
-        minimapMarkdown += `\n\n<uploaded_python_file>\nFile: ${uploadedPyFile.path}\n</uploaded_python_file>
-    
-    <execution_workflow>
-    **CRITICAL: Always execute code before manual reasoning**
-    
-    Step 1: Run the Python file first
-    Step 2: After execution (success or failure), analyze results
-    Step 3: If needed, think through logic, corrections, or missing mechanics
-    
-    This sequence saves significant time and effort.
-    </execution_workflow>
-    
-    <python_file_usage_example>
-    Reuse existing code with different inputs instead of rewriting. Adapt this template to your actual function names:
-    
-    \`\`\`python
-    import importlib.util, json, sys
-    
-    # Load the user's Python module dynamically
-    py_path = "${uploadedPyFile.path}"
-    json_path = "${uploadedFile.path}"
-    
-    spec = importlib.util.spec_from_file_location("pathfinding_code", py_path)
-    pathfinding_code = importlib.util.module_from_spec(spec)
-    sys.modules["pathfinding_code"] = pathfinding_code
-    spec.loader.exec_module(pathfinding_code)
-    
-    # Load grid and run pathfinding (adapt to actual functions)
-    grid = pathfinding_code.load_grid(json_path)
-    start = (11, 82)  # (x, y)
-    goal = (10, 2)    # (x, y)
-    keys = pathfinding_code.astar(grid, start, goal)
-    
-    # Optional diagnostics
-    height = len(grid)
-    width = len(grid[0]) if height > 0 else 0
-    reachable = bool(keys) or start == goal
-    \`\`\`
-    </python_file_usage_example>`;
-    }
-
-    const stream = openai.responses.stream({
-        model: config.openai.modelPathFinding,
-        service_tier: config.openai.service_tierPathfinding,
-        input: [
-            {
-                "role": "developer",
-                "content": pathFindingPrompt + "\n\nPathfinding policy:\n- The current map grid JSON is at: " + uploadedFile.path + ".\n- If you reuse the uploaded Python as-is, return an empty 'updated_code_path'.\n- If you modify or add code, save it inside the container under /mnt/data (e.g., /mnt/data/updated_pathfinder.py) and return that path in 'updated_code_path'.\n- Do NOT paste code in the JSON output.\n- Use the tool judiciously to avoid unnecessary runtime."
+        recordPathfindingUsage({
+            usage: {
+                input_tokens: 0,
+                output_tokens: 0,
+                total_tokens: 0,
+                input_tokens_details: { cached_tokens: 0 },
             },
-            {
-                "role": "user", "content": [
-                    {
-                        type: "input_text",
-                        text: minimapMarkdown
-                    }
-                ]
-            }
-        ],
-        reasoning: {
-            summary: config.openai.reasoningSummary,
-            effort: config.openai.reasoningEffortPathfinding,
-        },
-        store: false,
-        include: ["reasoning.encrypted_content", "code_interpreter_call.outputs"],
-        tools: [
-            {
-                type: "code_interpreter",
-                container: container.id
-            }
-        ],
-        text: {
-            format: {
-                type: "json_schema",
-                name: "path",
-                schema: {
-                    type: "object",
-                    properties: {
-                        keys: {
-                            // Array of Enum of keys
-                            type: "array",
-                            items: {
-                                type: "string",
-                                enum: ["up", "down", "left", "right"]
-                            }
-                        },
-                        explanation: {
-                            type: "string",
-                            description: "Explanation of your path - a brief summary of the route you took and your reasoning. If the target was unreachable, explain why and describe which nearby tile you selected instead. Include detailed information so the user fully understands the situation and doesn't think the pathfinding tool malfunctioned when it doesn't reach the exact target."
-                        },
-                        updated_code_path: {
-                            type: "string",
-                            description: "Absolute path (inside the container) to a newly created/updated Python file in /mnt/data when you changed the pathfinding code. Return an empty string if no code changes were made. Do not include code here."
-                        }
-                    },
-                    required: ["keys", "explanation", "updated_code_path"],
-                    additionalProperties: false,
-                },
-                strict: true,
-            }
+            cost: { fullCost: 0, discountedCost: 0 },
+            model: "local-pathfinder",
+            serviceTier: "local",
+        });
+        broadcast({
+            type: 'token_usage',
+            payload: { input_tokens: 0, output_tokens: 0, total_tokens: 0, cost: 0, discountedCost: 0 },
+        });
+
+        const reachedTarget = result.reachedTarget === true;
+        const finalPos = result.finalPosition || start;
+        const distance = Math.abs(finalPos.x - target.x) + Math.abs(finalPos.y - target.y);
+
+        const explanationParts = [];
+        if (reachedTarget) {
+            explanationParts.push(`Local pathfinding reached (${target.x}, ${target.y}).`);
+        } else {
+            explanationParts.push(
+                `Local pathfinding could not reach (${target.x}, ${target.y}); best reachable is (${finalPos.x}, ${finalPos.y}).`
+            );
         }
-    });
-
-    // --- Use for-await to process events ---
-    for await (const event of stream) {
-        switch (event.type) {
-            case "response.reasoning_summary_part.done":
-                broadcast({ type: 'reasoning_chunk', payload: "\n\n" });
-                process.stdout.write("\n\n");
-                break;
-            case "response.output_item.done":
-                if (event.item.type === "reasoning" || event.item.type === "output_text") {
-                    console.log("--------------------");
-                }
-                break;
-            case "response.reasoning_summary_text.delta":
-                process.stdout.write(event.delta);
-                broadcast({ type: 'reasoning_chunk', payload: event.delta });
-                break;
-            case "response.completed":
-                // Do nothing, will use stream.finalResponse() after loop
-                break;
-            case "response.code_interpreter_call.in_progress":
-                // The code is going to be written, do nothing
-                // process.stdout.write("\n```python\n");
-                broadcast({ type: 'reasoning_chunk', payload: "\n```python\n" });
-                break;
-            case "response.code_interpreter_call.interpreting":
-                // The code is being interpreted, do nothing
-                // process.stdout.write("\n```\n\n");
-                broadcast({ type: 'reasoning_chunk', payload: "\n```\n\n" });
-                break;
-            case "response.code_interpreter_call_code.delta":
-                // Do nothing, will be logged in the code_interpreter_call_code.done event
-                // Example of event:
-                // Event: {
-                //     "type": "response.code_interpreter_call_code.delta",
-                //     "sequence_number": 3391,
-                //     "output_index": 3,
-                //     "item_id": "ci_0953e4bb8232b81a0168f8d4528bf8819582fea32ed3d9d8f8",
-                //     "delta": "=",
-                //     "obfuscation": "V3NniqRN3T3kRdS"
-                //   }
-                if (event.delta) {
-                    // process.stdout.write(event.delta); 
-                    broadcast({ type: 'reasoning_chunk', payload: event.delta });
-                }
-                break;
-            case "response.code_interpreter_call_code.done":
-                if (event.code) {
-                    process.stdout.write("````python\n" + event.code + "\n````\n\n");
-                    // broadcast({ type: 'reasoning_chunk', payload: "````python\n" + event.code + "\n````\n\n" });
-                }
-                break;
-            default:
-                // Optionally log or handle unknown event types
-
-                // console.log("Unknown event type:", event.type);
-                // console.log("Event:", JSON.stringify(event, null, 2));
-                break;
+        explanationParts.push(`Start: (${start.x}, ${start.y}). Movement mode: ${movementMode}.`);
+        if (!reachedTarget) {
+            explanationParts.push(`Remaining distance: ${distance}.`);
         }
-    }
-
-    // After streaming, get the final response
-    const response = await stream.finalResponse();
-    const pathfindingDuration = Date.now() - pathfindingStart;
-    recordReasoningTime({
-        type: "pathfinding",
-        model: config.openai.modelPathFinding,
-        serviceTier: config.openai.service_tierPathfinding,
-        durationMs: pathfindingDuration,
-    });
-    // broadcast({ type: 'pathfinding_stream_end', payload: null });
-
-    setIsThinking(false);
-    const criticismCost = calculateRequestCost(response.usage, config.openai.modelPathFinding, config.openai.tokenPrice, config.openai.service_tierPathfinding);
-    if (criticismCost !== null) {
-        console.log(`Estimated Cost: $${criticismCost.fullCost} (Discounted: $${criticismCost.discountedCost})`);
-        broadcast({ type: 'token_usage', payload: { ...response.usage, cost: criticismCost.fullCost, discountedCost: criticismCost.discountedCost } });
-    } else {
-        broadcast({ type: 'token_usage', payload: response.usage });
-    }
-    console.log("Response:", JSON.stringify(response, null, 2));
-
-    const event = JSON.parse(response.output.find(item => item.type === "message").content.find(item => item.type === "output_text").text);
-    const fullWorkingCodePath = path.join(__dirname, '..', '..', 'tmp', 'temp_full_working_code.py');
-    if (event.updated_code_path) {
-        try {
-            const listResponse = await axios.get(`https://api.openai.com/v1/containers/${container.id}/files`, {
-                headers: { 'Authorization': `Bearer ${process.env.OPENAI_API_KEY}` }
-            });
-
-            const updatedFile = listResponse.data?.data?.find(file => file.path === event.updated_code_path);
-            if (!updatedFile) {
-                throw new Error(`Updated code file not found at path ${event.updated_code_path}`);
-            }
-
-            const fileContentResponse = await axios.get(`https://api.openai.com/v1/containers/${container.id}/files/${updatedFile.id}/content`, {
-                headers: { 'Authorization': `Bearer ${process.env.OPENAI_API_KEY}` },
-                responseType: 'arraybuffer'
-            });
-
-            await fs.writeFile(fullWorkingCodePath, fileContentResponse.data);
-            console.log(`Updated working code downloaded from ${event.updated_code_path} to ${fullWorkingCodePath}`);
-        } catch (downloadError) {
-            console.error("❌ Failed to download updated code:", downloadError.response?.data || downloadError.message);
+        if (explanation) {
+            explanationParts.push(`Request context: ${explanation}`);
         }
-    } else {
-        console.log("No updated code provided by pathfinding model.");
+
+        return {
+            keys: result.keys || [],
+            explanation: explanationParts.join(" "),
+            updated_code_path: "",
+            reached_target: reachedTarget,
+            final_position: finalPos,
+        };
+    } finally {
+        setIsThinking(false);
     }
-    return event;
 }
 
 /**

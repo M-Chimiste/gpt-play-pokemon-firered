@@ -1,6 +1,6 @@
 # GPT Plays Pokemon FireRed
 
-> An autonomous AI agent that plays Pokemon FireRed in real time, powered by OpenAI's LLM — with a live web dashboard for monitoring.
+> An autonomous AI agent that plays Pokemon FireRed in real time, powered by OpenAI or local LLMs via LM Studio — with a live web dashboard for monitoring.
 
 ---
 
@@ -25,7 +25,7 @@ This project connects a large language model (LLM) to a running instance of **Po
 | Node.js | 18+ |
 | mGBA | With Lua scripting support enabled |
 | Pokemon FireRed ROM | `.gba` file (not included) |
-| OpenAI API key | Set as `OPENAI_API_KEY` |
+| LLM access | OpenAI API key or LM Studio local server |
 
 ### ROM Compatibility
 
@@ -46,7 +46,7 @@ The harness is currently compatible only with the **Pokemon - FireRed Version (U
 │   └── prompts/                # Prompts used by the AI agent
 ├── frontend/                   # Static HTML/CSS/JS monitoring dashboard
 ├── .env.example                # Environment template (bridge / mGBA)
-└── server/.env.example         # Environment template (agent / OpenAI)
+└── server/.env.example         # Environment template (agent / LLM)
 ```
 
 ---
@@ -94,7 +94,13 @@ Copy-Item server/.env.example server/.env
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `OPENAI_API_KEY` | Your OpenAI API key | *(required)* |
+| `LLM_PROVIDER` | `openai` or `lmstudio` | `openai` |
+| `LLM_BASE_URL` | Base URL for OpenAI-compatible API (LM Studio default) | `http://127.0.0.1:1234/v1` |
+| `LLM_ALLOW_IMAGES` | Enable image inputs (set `false` for text-only models) | `true` |
+| `LLM_API_KEY` | Optional provider API key (falls back to `OPENAI_API_KEY`) | *(optional)* |
+| `OPENAI_API_KEY` | OpenAI API key (required when `LLM_PROVIDER=openai`) | *(required for OpenAI)* |
+| `OPENAI_MODEL` | Model name (OpenAI or LM Studio model ID) | `gpt-5.2` |
+| `OPENAI_ALLOW_IMAGES` | Override image input behavior | *(optional)* |
 | `PYTHON_BASE_URL` | Bridge API URL | `http://127.0.0.1:8000` |
 | `WS_PORT` | WebSocket port for the dashboard | `9885` |
 
@@ -111,6 +117,16 @@ Copy-Item server/.env.example server/.env
 | `FIRERED_SCREENSHOT_DIR` | Screenshot output directory | `tmp_screenshots` |
 
 > **Note:** The Lua script in mGBA starts listening on port `8888` and increments if the port is busy. The Python bridge scans the range `MGBA_SOCKET_PORT` → `MGBA_SOCKET_PORT_MAX`. If mGBA listens outside this range, the connection will fail.
+
+### Local inference with LM Studio (optional)
+
+1. Start LM Studio and enable the OpenAI-compatible server.
+2. In `server/.env`, set:
+   - `LLM_PROVIDER=lmstudio`
+   - `LLM_BASE_URL=http://127.0.0.1:1234/v1` (or your configured host/port)
+   - `OPENAI_MODEL=<your-loaded-model-id>`
+   - `LLM_ALLOW_IMAGES=false` if your model is text-only
+3. If you configured LM Studio authentication, set `LLM_API_KEY`.
 
 ### 4. Install dependencies
 
@@ -224,18 +240,28 @@ Once everything is running, verify each layer:
 </details>
 
 <details>
-<summary><strong><code>server/.env</code> — Node.js agent / OpenAI</strong></summary>
+<summary><strong><code>server/.env</code> — Node.js agent / LLM</strong></summary>
 
 **Server:**
 - `WS_PORT` — WebSocket port
 - `PYTHON_BASE_URL` — Bridge API URL
 
-**OpenAI:**
-- `OPENAI_API_KEY` — API key *(required)*
-- `OPENAI_MODEL`, `OPENAI_MODEL_PATHFINDING` — Model selection
+**LLM provider:**
+- `LLM_PROVIDER` — `openai` or `lmstudio`
+- `LLM_BASE_URL` — OpenAI-compatible base URL (LM Studio uses `http://127.0.0.1:1234/v1`)
+- `LLM_ALLOW_IMAGES` — Enable/disable image inputs (set false for text-only models)
+- `LLM_API_KEY` — Optional provider key (falls back to `OPENAI_API_KEY`)
+
+**Model settings (OpenAI or LM Studio):**
+- `OPENAI_API_KEY` — API key *(required for OpenAI)*
+- `OPENAI_MODEL` — Model selection
+- `OPENAI_ALLOW_IMAGES` — Override image input behavior
 - `OPENAI_REASONING_EFFORT*` — Reasoning effort settings
 - `OPENAI_TOKEN_LIMIT`, `OPENAI_TIMEOUT_MS` — Limits
 - `OPENAI_SERVICE_TIER*` — Service tier settings
+
+**Pathfinding:**
+- Pathfinding runs locally (no OpenAI containers required).
 
 </details>
 
@@ -297,9 +323,10 @@ The project generates the following files and directories during execution:
 </details>
 
 <details>
-<summary><strong>OpenAI errors</strong></summary>
+<summary><strong>LLM errors (OpenAI / LM Studio)</strong></summary>
 
-- Verify `OPENAI_API_KEY` is set correctly in `server/.env`
+- For OpenAI: verify `OPENAI_API_KEY` (or `LLM_API_KEY`) is set correctly
+- For LM Studio: ensure the local server is running and `LLM_BASE_URL` matches it
 - **Restart the Node.js server** after any `.env` change
 
 </details>

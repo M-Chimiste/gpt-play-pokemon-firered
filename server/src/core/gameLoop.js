@@ -23,6 +23,11 @@ const {
     getCumulativeTotals: getCumulativeTimeTotals,
 } = require('../utils/timeTracker');
 
+const costOptions = {
+    logMissing: config.openai.provider === "openai",
+    applyServiceTier: config.openai.provider === "openai",
+};
+
 // Keep markers with NPC-linked UIDs in sync with current npc_entries positions
 // Returns true if any marker was moved
 function reconcileMarkersWithNpcEntries(gameDataJson) {
@@ -257,11 +262,18 @@ async function gameLoop() {
 
 
             // 2. Build vision payload (raw screenshot x3 + optional overlay in overworld)
-            const { image1Base64, image2Base64, error: visionError } = await buildVisionPayload(gameDataJson);
-            if (!image1Base64) {
-                console.error(`Could not build vision payload: ${visionError || "Unknown error"}. Pausing...`);
-                await new Promise(resolve => setTimeout(resolve, 5000)); // Wait 5s
-                continue;
+            const allowImages = !!config.openai.allowImages;
+            let image1Base64 = null;
+            let image2Base64 = null;
+            if (allowImages) {
+                const visionPayload = await buildVisionPayload(gameDataJson);
+                image1Base64 = visionPayload.image1Base64;
+                image2Base64 = visionPayload.image2Base64;
+                if (!image1Base64) {
+                    console.error(`Could not build vision payload: ${visionPayload.error || "Unknown error"}. Pausing...`);
+                    await new Promise(resolve => setTimeout(resolve, 5000)); // Wait 5s
+                    continue;
+                }
             }
             // 3. Build the user input for the AI
 
@@ -382,7 +394,13 @@ async function gameLoop() {
 	                                    durationMs: summaryDuration,
 	                                });
 	                                // <<< Calculate and log cost >>>
-	                                const summaryCost = calculateRequestCost(event.response.usage, config.openai.model, config.openai.tokenPrice, config.openai.service_tierSummary);
+	                                const summaryCost = calculateRequestCost(
+	                                    event.response.usage,
+	                                    config.openai.model,
+	                                    config.openai.tokenPrice,
+	                                    config.openai.service_tierSummary,
+	                                    costOptions
+	                                );
 	                                if (summaryCost !== null) {
 	                                    console.log(`Estimated Cost: $${summaryCost.fullCost} (Discounted: $${summaryCost.discountedCost})`);
 	                                    broadcast({ type: 'token_usage', payload: { ...event.response.usage, cost: summaryCost.fullCost, discountedCost: summaryCost.discountedCost } }); // Include cost
@@ -548,7 +566,8 @@ async function gameLoop() {
                                                 event.response.usage,
                                                 config.openai.model,
                                                 config.openai.tokenPrice,
-                                                config.openai.service_tierSummary
+                                                config.openai.service_tierSummary,
+                                                costOptions
                                             );
                                             if (rollupCost !== null) {
                                                 console.log(
@@ -731,9 +750,11 @@ async function gameLoop() {
                 if (canExtendLastToolOutput) {
                     const appendedOutputItems = [];
 
-                    appendedOutputItems.push({ "type": "input_image", "image_url": `data:image/png;base64,${image1Base64}` });
-                    if (image2Base64) {
-                        appendedOutputItems.push({ "type": "input_image", "image_url": `data:image/png;base64,${image2Base64}` });
+                    if (allowImages) {
+                        appendedOutputItems.push({ "type": "input_image", "image_url": `data:image/png;base64,${image1Base64}` });
+                        if (image2Base64) {
+                            appendedOutputItems.push({ "type": "input_image", "image_url": `data:image/png;base64,${image2Base64}` });
+                        }
                     }
                     appendedOutputItems.push({ "type": "input_text", "text": userInputText });
 
@@ -744,9 +765,12 @@ async function gameLoop() {
                     // if (mapDisplayRef) {
                     //     broadcast({ type: 'map_update', payload: mapDisplayRef });
                     // }
-                    const content = [{ "type": "input_image", "image_url": `data:image/png;base64,${image1Base64}` }];
-                    if (image2Base64) {
-                        content.push({ "type": "input_image", "image_url": `data:image/png;base64,${image2Base64}` });
+                    const content = [];
+                    if (allowImages) {
+                        content.push({ "type": "input_image", "image_url": `data:image/png;base64,${image1Base64}` });
+                        if (image2Base64) {
+                            content.push({ "type": "input_image", "image_url": `data:image/png;base64,${image2Base64}` });
+                        }
                     }
                     content.push({ "type": "input_text", "text": userInputText });
                     newUserMessage = { "role": "user", "content": content };
@@ -852,7 +876,13 @@ async function gameLoop() {
 	                                    durationMs: criticismDuration,
 	                                });
 	                                // <<< Calculate and log cost >>>
-	                                const criticismCost = calculateRequestCost(event.response.usage, config.openai.model, config.openai.tokenPrice, config.openai.service_tierSelfCriticism);
+	                                const criticismCost = calculateRequestCost(
+	                                    event.response.usage,
+	                                    config.openai.model,
+	                                    config.openai.tokenPrice,
+	                                    config.openai.service_tierSelfCriticism,
+	                                    costOptions
+	                                );
 	                                if (criticismCost !== null) {
 	                                    console.log(`Estimated Cost: $${criticismCost.fullCost} (Discounted: $${criticismCost.discountedCost})`);
 	                                    broadcast({ type: 'token_usage', payload: { ...event.response.usage, cost: criticismCost.fullCost, discountedCost: criticismCost.discountedCost } }); // Include cost
@@ -993,7 +1023,13 @@ async function gameLoop() {
                                 durationMs: mainDuration,
                             });
                             // <<< Calculate and log cost >>>
-                            const requestCost = calculateRequestCost(event.response.usage, config.openai.model, config.openai.tokenPrice, config.openai.service_tier);
+                            const requestCost = calculateRequestCost(
+                                event.response.usage,
+                                config.openai.model,
+                                config.openai.tokenPrice,
+                                config.openai.service_tier,
+                                costOptions
+                            );
                             if (requestCost !== null) {
                                 console.log(`Estimated Cost: $${requestCost.fullCost} (Discounted: $${requestCost.discountedCost})`);
                                 broadcast({ type: 'token_usage', payload: { ...event.response.usage, cost: requestCost.fullCost, discountedCost: requestCost.discountedCost } }); // Include cost

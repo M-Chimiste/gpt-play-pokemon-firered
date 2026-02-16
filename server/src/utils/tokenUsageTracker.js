@@ -4,6 +4,11 @@ const path = require("path");
 const { config } = require("../config");
 const { calculateRequestCost } = require("./costs");
 
+const costOptions = {
+  logMissing: config.openai.provider === "openai",
+  applyServiceTier: config.openai.provider === "openai",
+};
+
 const EMPTY_TOTALS = () => ({
   input_tokens: 0,
   cached_input_tokens: 0,
@@ -69,7 +74,7 @@ function recordLoopUsage({ callType, usage, cost, model, serviceTier }) {
   if (!accumulator) return;
   let resolvedCost = cost;
   if (!resolvedCost) {
-    resolvedCost = calculateRequestCost(usage, model, config.openai.tokenPrice, serviceTier);
+    resolvedCost = calculateRequestCost(usage, model, config.openai.tokenPrice, serviceTier, costOptions);
   }
   addCall("loop", {
     type: callType,
@@ -85,7 +90,7 @@ function recordPathfindingUsage({ usage, cost, model, serviceTier }) {
   if (!accumulator) return;
   let resolvedCost = cost;
   if (!resolvedCost) {
-    resolvedCost = calculateRequestCost(usage, model, config.openai.tokenPrice, serviceTier);
+    resolvedCost = calculateRequestCost(usage, model, config.openai.tokenPrice, serviceTier, costOptions);
   }
   addCall("pathfinding", {
     type: "pathfinding",

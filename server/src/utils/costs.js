@@ -1,6 +1,10 @@
-function calculateRequestCost(usage, modelName, priceConfig, serviceTier) {
-  if (!usage || !priceConfig[modelName]) {
-    console.warn("Could not calculate cost: Missing usage data or price config for model:", modelName);
+function calculateRequestCost(usage, modelName, priceConfig, serviceTier, options = {}) {
+  const logMissing = options.logMissing !== false;
+  const applyServiceTier = options.applyServiceTier !== false;
+  if (!usage || !priceConfig || !priceConfig[modelName]) {
+    if (logMissing) {
+      console.warn("Could not calculate cost: Missing usage data or price config for model:", modelName);
+    }
     return null;
   }
 
@@ -22,13 +26,13 @@ function calculateRequestCost(usage, modelName, priceConfig, serviceTier) {
   const totalCost = inputCost + outputCost;
   const fullCost = parseFloat(totalCost.toFixed(6));
 
-  let discountedCost;
-  if (serviceTier === "flex") {
-    discountedCost = parseFloat((totalCost * 0.5).toFixed(6));
-  } else if (serviceTier === "priority") {
-    discountedCost = parseFloat((totalCost * 2).toFixed(6));
-  } else {
-    discountedCost = fullCost;
+  let discountedCost = fullCost;
+  if (applyServiceTier) {
+    if (serviceTier === "flex") {
+      discountedCost = parseFloat((totalCost * 0.5).toFixed(6));
+    } else if (serviceTier === "priority") {
+      discountedCost = parseFloat((totalCost * 2).toFixed(6));
+    }
   }
 
   return { fullCost, discountedCost };
